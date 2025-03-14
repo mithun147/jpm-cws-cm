@@ -1,0 +1,209 @@
+name: Build & Sync With Adobe Git Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifactsJson:
+        description: 'Maven artifacts represented as JSON array. E.g [{"groupId":"com.practice","artifactId":"practice-lib","version":"1.0.0"}]'
+        required: false
+        default: '[]'
+      sync_artifacts:
+        description: 'Sync artifacts'
+        required: true
+        default: 'true'
+      deploy_artifacts:
+        description: 'Deploy artifacts'
+        required: true
+        default: 'false'
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+
+    env:
+      MAVEN_PRIVATE_REPO_USERNAME: ${{ secrets.MAVEN_PRIVATE_REPO_USERNAME }}
+      MAVEN_PRIVATE_REPO_PASSWORD: ${{ secrets.MAVEN_PRIVATE_REPO_PASSWORD }}
+      MAVEN_PRIVATE_REPO_URL: ${{ secrets.MAVEN_PRIVATE_REPO_URL }}
+      CM_AIO_ORG_ID: ${{ secrets.CM_ORG_ID }}      
+      CM_AIO_PROGRAM_ID: ${{ secrets.CM_PROGRAM_ID }}
+      CM_PROD_PIPELINE_ID: ${{ secrets.CM_PROD_PIPELINE_ID }}
+      CM_DEV_PIPELINE_ID: ${{ secrets.CM_DEV_PIPELINE_ID }}
+      CM_RDE_ENV_ID: ${{ secrets.CM_RDE_ENV_ID }}
+      GS4TR_REPO_PASSWORD: ${{ secrets.GS4TR_REPO_PASSWORD }}
+      REMOTE_GIT_REPO_URL:  ${{ secrets.REMOTE_CM_WRAPPER_GIT_REPO_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Common Git Config
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+      - name: Install Python Deps
+        run: |
+          pip install lxml requests
+      - name: Validate Artifacts JSON
+        id: validate-json
+        run: |
+          if [ -n "${{ github.event.inputs.artifactsJson }}" ]; then
+            if [ "$(echo "${{ github.event.inputs.artifactsJson }}" | jq length)" -eq 0 ]; then
+              echo "artifact_json_valid=false" >> $GITHUB_ENV
+            else
+              echo "${{ github.event.inputs.artifactsJson }}" | jq '.' > artifacts.json
+              echo "artifact_json_valid=true" >> $GITHUB_ENV
+            fi  
+          else
+            echo "No artifacts JSON provided."
+            echo "artifact_json_valid=false" >> $GITHUB_ENV
+          fi
+      - name: Process Artifacts JSON & Update POM
+        if: env.artifact_json_valid == 'true'
+        run: |
+          set -e
+          set -x
+          ls -ltr all/
+          echo "${{ github.event.inputs.artifactsJson }}" | jq '.' > artifacts.json
+          python scripts/process_artifacts.py --json-content "$(cat artifacts.json)"
+            git --no-pager diff all/pom.xml
+            if [ -n "$(git status --porcelain)" ]; then
+            git add all/pom.xml
+            git commit -m "Update POM with new artifacts"
+            else
+            echo "No changes to commit."
+            fi
+          ls -ltrR all/lib
+  
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Maven
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.8.2
+      
+      - name: Configure Maven Settings
+        uses: s4u/maven-settings-action@v3.1.0
+
+      - name: Install Filesystem Maven Artifacts
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev')
+        run: |
+          python scripts/install_fs_artifacts.py
+      - name: Validate Build
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev')
+        run: |
+          mvn clean install -DskipTests
+      - name: Push Pending Commits
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git push origin HEAD:sandbox/aggregator/dev
+          else
+            echo "No pending commits to push."
+          fi
+      - name: Set up Node.js
+        if: github.event.inputs.deploy_artifacts == 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Setup Adobe IO CLI
+        uses: adobe/aio-cli-setup-action@1.3.0
+        if: github.event.inputs.deploy_artifacts == 'true'
+
+      - name: Install & Configure - Adobe I/O CLI & Plugins
+        if: github.event.inputs.deploy_artifacts == 'true'
+        run: |
+          set -e
+          set -x
+          aio plugins:install @adobe/aio-cli-plugin-cloudmanager
+          echo "${{ secrets.CM_API_SERVICE_ACCOUNT_JSON }}" | base64 --decode > /tmp/aio-service-account.json
+          aio config:set ims.contexts.aio-cli-plugin-cloudmanager /tmp/aio-service-account.json --file --json
+          echo "config json reset"
+          aio config:set cloudmanager_programid ${{ env.CM_AIO_PROGRAM_ID }}
+          echo "program id set"
+          aio cloudmanager:program:list-pipelines
+          echo "above pipelines are the accurate list for the given program id"
+          aio plugins:install @adobe/aio-cli-plugin-aem-rde
+          aio plugins:update
+          aio cloudmanager:program:list-environments
+          echo "Above command displays latest list of environments"
+          aio config:set ims.contexts.aio-cli-plugin-aem-rde /tmp/aio-service-account.json --file --json
+          aio config:set cloudmanager_orgid ${{ env.CM_AIO_ORG_ID }}
+          # aio config:set cloudmanager_environmentid ${{ env.CM_RDE_ENV_ID }}
+          aio config:set cloudmanager_environmentid 1544319
+          aio aem:rde:status
+      - name: Deploy to RDE (Develop)
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev') && github.event.inputs.deploy_artifacts == 'true'
+        run: |
+          set -e
+          set -x
+          # aio aem:rde:setup
+          # Install the 'all' content package (zip file)
+            zip_files=$(ls all/target/*.zip)
+            for zip_file in $zip_files; do
+            if [[ $zip_file =~ ^all/target/[^/]+-[0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?\.zip$ ]]; then
+              aio aem:rde:install $zip_file
+            else
+              echo "File $zip_file does not meet the criteria."
+            fi
+            done
+      - name: Push Artifacts To Adobe CM Git Repo Dev Branch
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev') && (github.event.inputs.deploy_artifacts == 'true' || github.event.inputs.sync_artifacts == 'true')
+        run: |
+          set -e
+          set -x
+          remote_url="${{ env.REMOTE_GIT_REPO_URL }}"
+          remote_url="${remote_url#https://}"
+          pwd
+          git clone --single-branch --branch sandbox/aggregator/dev "https://${{ secrets.REMOTE_REPO_USERNAME }}:${{ secrets.REMOTE_REPO_PASSWORD }}@$remote_url" aggregator-repo
+          all_module_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          rm -Rf aggregator-repo/all/lib/*.zip
+          cd aggregator-repo
+          git status
+          ls -ltr
+          mkdir -p ./all/lib/
+          cp ../all/target/*.zip ./all/lib/
+            # Update the jpmcp.aggregator.version property in the aggregator repo's pom.xml
+            sed -i "s/<jpmcp.aggregator.version>.*<\/jpmcp.aggregator.version>/<jpmcp.aggregator.version>$all_module_version<\/jpmcp.aggregator.version>/" all/pom.xml
+            git add all/
+            if [ -n "$(git status --porcelain)" ]; then
+              git commit -m "Aggregator zip file added/replaced (version: $all_module_version)"
+              
+              # Use Maven Versions Plugin to set the next snapshot version
+              pwd
+                mvn versions:set -DnextSnapshot -s ../.mvn/settings.xml
+                git add pom.xml **/pom.xml
+              git commit -m "Version bump post aggregator repo sync"
+              git push origin sandbox/aggregator/dev
+            else
+              echo "No changes to commit."
+            fi
+            git status
+          cd ..
+          rm -Rf aggregator-repo
+          git status
+      
+
+      - name: Bump Version (Develop)
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev') && github.event.inputs.deploy_artifacts == 'true' && success()
+        run: |
+          # Increment the version for the next snapshot
+          current_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          new_version=$(echo $current_version | sed 's/-SNAPSHOT$//') # Remove SNAPSHOT for version increment
+          # Increment the version (e.g., 1.0.0 -> 1.0.1)
+          new_version=$(echo $new_version | awk -F. -v OFS=. '{ $NF++; } 1')-SNAPSHOT
+          # Update the version in the pom.xml
+          mvn versions:set -DnewVersion=$new_version
+          # Commit the version change back to the repository
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git commit -am "Bump version to $new_version"
+          git push origin
+      - name: Deploy Packages (AEMaaCS Dev Env)
+        if: startsWith(github.ref_name, 'sandbox/aggregator/dev') && github.event.inputs.deploy_artifacts == 'true'
+        run: |
+          aio cloudmanager pipeline create-execution ${{ env.CM_DEV_PIPELINE_ID }}
